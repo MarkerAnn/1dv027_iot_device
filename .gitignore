@@ -1,0 +1,20 @@
+# Configuration files with sensitive data
+config.py
+
+# MicroPython compiled files
+*.mpy
+
+# IDE files
+.vscode/
+*.pyc
+__pycache__/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Backup files
+*.bak
+*.backup
+repomix-output.txt
+.env
