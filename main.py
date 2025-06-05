@@ -35,8 +35,11 @@ def connect_wifi(ssid, password):
     print("Connected to WiFi:", wlan.ifconfig())
     return wlan
 
+
 # Connect to WiFi
 connect_wifi(WIFI_SSID, WIFI_PASSWORD)
+print("WiFi connection established.")
+time.sleep(5)  # Allow time for connection to stabilize
 
 
 # ==== MQTT Client ====
@@ -67,7 +70,15 @@ for pwm in [rgb_red, rgb_green, rgb_blue]:
     pwm.freq(1000)
 
 print("Waiting for first sensor values...")
-time.sleep(5)
+time.sleep(10)
+
+# ===== Recovery Tracking =====
+scd40_fail_count = 0
+soil_fail_count = 0
+MAX_SENSOR_FAILS = 5  # Max consecutive failures before recovery, RESET
+last_scd40_read = time.time()  # FIXED: Removed double underscore
+last_soil_read = time.time()
+SENSOR_TIMEOUT = 300  # 5 minutes timeout data -> reset sensor
 
 
 def set_rgb(r: int, g: int, b: int):
@@ -108,58 +119,160 @@ def update_soil_rgb(moisture: int):
         set_rgb(0, 0, 65535)  # Blue (very wet)
 
 
-# ==== Main Loop ====
-while True:
+def reset_scd40():
+    """Reset SCD40 sensor when it gets stuck"""
+    global scd40_fail_count, last_scd40_read
+    print("🔄 Resetting SCD40 sensor...")
     try:
-        data = {}
+        scd.stop_periodic_measurement()
+        time.sleep(1)
+        scd.start_periodic_measurement()
+        time.sleep(2)
+        scd40_fail_count = 0
+        print("✅ SCD40 reset complete")
+    except Exception as e:
+        print(f"❌ SCD40 reset failed: {e}")
+
+
+def reset_soil_sensor():
+    """Reset STEMMA Soil sensor by reinitializing"""
+    global soil_fail_count, last_soil_read, soil
+    print("🔄 Resetting STEMMA Soil sensor...")
+    try:
+        # Reinitialize the soil sensor
+        soil = StemmaSoilSensor(i2c)
+        time.sleep(1)
+        soil_fail_count = 0
+        print("✅ Soil sensor reset complete")
+    except Exception as e:
+        print(f"❌ Soil sensor reset failed: {e}")
+
+
+def read_scd40_with_recovery():
+    """Read SCD40 with automatic recovery on failures"""
+    global scd40_fail_count, last_scd40_read
+
+    try:
+        # Check if too much time has passed without successful read
+        if time.time() - last_scd40_read > SENSOR_TIMEOUT:
+            print(f"⏰ SCD40 timeout ({SENSOR_TIMEOUT}s), forcing reset...")
+            reset_scd40()
+            return None
+
+        # Try to read data
         if scd.data_ready:
             co2 = scd.co2
             temp_air = round(scd.temperature, 2)
             rh_air = round(scd.relative_humidity, 1)
 
-            print("CO2:", co2, "ppm")
-            print("Air temperature:", temp_air, "C")
-            print("Air humidity:", rh_air, "%")
+            # Validate readings (basic sanity check)
+            if co2 is None or co2 < 300 or co2 > 5000:
+                raise ValueError(f"Invalid CO2 reading: {co2}")
+            if temp_air is None or temp_air < -20 or temp_air > 60:
+                raise ValueError(f"Invalid temperature reading: {temp_air}")
+            if rh_air is None or rh_air < 0 or rh_air > 100:
+                raise ValueError(f"Invalid humidity reading: {rh_air}")
 
+            print(f"CO2: {co2} ppm, Air temp: {temp_air}°C, Humidity: {rh_air}%")
             update_co2_leds(co2)
 
-            data.update(
-                {
-                    "co2": co2,
-                    "temp_air": temp_air,
-                    "rh_air": rh_air,
-                }
-            )
+            # Reset fail counter on successful read
+            scd40_fail_count = 0
+            last_scd40_read = time.time()
+
+            return {
+                "co2": co2,
+                "temp_air": temp_air,
+                "rh_air": rh_air,
+            }
         else:
-            print("No new air values yet.")
+            print("SCD40 data not ready yet...")
+            scd40_fail_count += 1
 
-        try:
-            moisture = soil.get_moisture()
-            temp_soil = round(soil.get_temp(), 2)
+            # Reset sensor if too many consecutive failures
+            if scd40_fail_count >= MAX_SENSOR_FAILS:
+                print(f"⚠️ SCD40 failed {MAX_SENSOR_FAILS} times, resetting...")
+                reset_scd40()
 
-            print("Soil moisture:", moisture)
-            print("Soil temperature:", temp_soil, "C")
+            return None
 
-            update_soil_rgb(moisture)
+    except Exception as e:
+        print(f"❌ SCD40 error: {e}")
+        scd40_fail_count += 1
 
-            data.update(
-                {
-                    "moisture": moisture,
-                    "temp_soil": temp_soil,
-                }
-            )
+        if scd40_fail_count >= MAX_SENSOR_FAILS:
+            reset_scd40()
 
-        except Exception as e:
-            print("Soil sensor error:", e)
+        return None
+
+
+def read_soil_with_recovery():
+    """Read STEMMA Soil sensor with automatic recovery on failures"""
+    global soil_fail_count, last_soil_read
+
+    try:
+        # Check timeout
+        if time.time() - last_soil_read > SENSOR_TIMEOUT:
+            print(f"⏰ Soil sensor timeout ({SENSOR_TIMEOUT}s), forcing reset...")
+            reset_soil_sensor()
+            return None
+
+        # Read moisture and temperature
+        moisture = soil.get_moisture()
+        temp_soil = round(soil.get_temp(), 2)
+
+        # Validate readings
+        if moisture is None or moisture < 0 or moisture > 4095:
+            raise ValueError(f"Invalid moisture reading: {moisture}")
+        if temp_soil is None or temp_soil < -20 or temp_soil > 60:
+            raise ValueError(f"Invalid soil temperature: {temp_soil}")
+
+        print(f"Soil moisture: {moisture}, Soil temp: {temp_soil}°C")
+        update_soil_rgb(moisture)
+
+        # Reset fail counter on successful read
+        soil_fail_count = 0
+        last_soil_read = time.time()
+
+        return {
+            "moisture": moisture,
+            "temp_soil": temp_soil,
+        }
+
+    except Exception as e:
+        print(f"❌ Soil sensor error: {e}")
+        soil_fail_count += 1
+
+        if soil_fail_count >= MAX_SENSOR_FAILS:
+            print(f"⚠️ Soil sensor failed {MAX_SENSOR_FAILS} times, resetting...")
+            reset_soil_sensor()
+
+        return None
+
+
+# ==== Main Loop ====
+while True:
+    try:
+        data = {}
+
+        # Read SCD40 with recovery
+        scd40_data = read_scd40_with_recovery()
+        if scd40_data:
+            data.update(scd40_data)
+
+        # Read soil sensor with recovery
+        soil_data = read_soil_with_recovery()
+        if soil_data:
+            data.update(soil_data)
 
         # Send data to MQTT broker
         if data:
             client.publish(MQTT_TOPIC_BASE.encode(), json.dumps(data))
-            print("Data sent to MQTT:", data)
+            print(f"📡 Data sent to MQTT: {data}")
         else:
             print("No data to send.")
 
     except Exception as e:
-        print("Unexpected error:", e)
+        print(f"❌ Unexpected error: {e}")
 
     time.sleep(MEASUREMENT_INTERVAL)
